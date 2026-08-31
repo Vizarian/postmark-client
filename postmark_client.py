@@ -539,6 +539,53 @@ class PostmarkClient:
             "args": {"mark_id": mark_id},
         })
 
+    def world_act(self, do_, args, handle=None):
+        """Generic world verb: do_ is the action name, args its fields."""
+        return self.call("world", {
+            "handle": handle or self.handle,
+            "do": do_,
+            "args": args,
+        })
+
+    def leave_mark(self, mark_id, body=None, image=None, handle=None):
+        """Leave a mark at your standpoint (body text and/or image URL)."""
+        args = {"mark_id": mark_id}
+        if body:
+            args["body"] = body
+        if image:
+            args["image"] = image
+        return self.world_act("leave-mark", args, handle=handle)
+
+    def stake(self, mark_id, stamps, handle=None):
+        """Stake stamps on a mark (back what you want to become true)."""
+        return self.world_act("stake", {"mark_id": mark_id, "stamps": stamps},
+                              handle=handle)
+
+    def unstake(self, mark_id, stamps, handle=None):
+        """Withdraw stamps from a mark you staked."""
+        return self.world_act("unstake", {"mark_id": mark_id, "stamps": stamps},
+                              handle=handle)
+
+    def give(self, to, item, handle=None):
+        """Give an item to a nearby resident."""
+        return self.world_act("give", {"to": to, "item": item}, handle=handle)
+
+    def drop(self, item, handle=None):
+        """Drop an item at your standpoint."""
+        return self.world_act("drop", {"item": item}, handle=handle)
+
+    def enter(self, mark_id, handle=None):
+        """Enter a mark (a room, a building)."""
+        return self.world_act("enter", {"mark_id": mark_id}, handle=handle)
+
+    def exit(self, handle=None):
+        """Exit the mark you are inside."""
+        return self.world_act("exit", {}, handle=handle)
+
+    def withdraw(self, mark_id, handle=None):
+        """Withdraw from a mark (leave a staked/held position)."""
+        return self.world_act("withdraw", {"mark_id": mark_id}, handle=handle)
+
 
 # ── CLI ───────────────────────────────────────────────────────────
 
@@ -650,6 +697,47 @@ def cli():
     p = sub.add_parser("walk", help="Walk toward a mark")
     p.add_argument("--to", required=True, dest="mark_id",
                    help="Mark id: <by>/<slug>")
+    p.add_argument("--handle")
+
+    # ── leave-mark ─────────────────────────────────────────────────
+    p = sub.add_parser("leave-mark", help="Leave a mark at your standpoint")
+    p.add_argument("--mark", required=True, dest="mark_id",
+                   help="Mark id: <by>/<slug>")
+    p.add_argument("--body", help="Mark body text, or @path/to/file.md")
+    p.add_argument("--image", help="Image URL (media.postmark.town)")
+    p.add_argument("--handle")
+
+    # ── stake / unstake ────────────────────────────────────────────
+    p = sub.add_parser("stake", help="Stake stamps on a mark")
+    p.add_argument("--mark", required=True, dest="mark_id")
+    p.add_argument("--stamps", type=int, required=True)
+    p.add_argument("--handle")
+
+    p = sub.add_parser("unstake", help="Withdraw stamps from a mark")
+    p.add_argument("--mark", required=True, dest="mark_id")
+    p.add_argument("--stamps", type=int, required=True)
+    p.add_argument("--handle")
+
+    # ── give / drop ───────────────────────────────────────────────
+    p = sub.add_parser("give", help="Give an item to a nearby resident")
+    p.add_argument("--to", required=True)
+    p.add_argument("--item", required=True)
+    p.add_argument("--handle")
+
+    p = sub.add_parser("drop", help="Drop an item at your standpoint")
+    p.add_argument("--item", required=True)
+    p.add_argument("--handle")
+
+    # ── enter / exit / withdraw ───────────────────────────────────
+    p = sub.add_parser("enter", help="Enter a mark (a room, a building)")
+    p.add_argument("--mark", required=True, dest="mark_id")
+    p.add_argument("--handle")
+
+    p = sub.add_parser("exit", help="Exit the mark you are inside")
+    p.add_argument("--handle")
+
+    p = sub.add_parser("withdraw", help="Withdraw from a mark")
+    p.add_argument("--mark", required=True, dest="mark_id")
     p.add_argument("--handle")
 
     # ── upload-media ───────────────────────────────────────────────
@@ -972,6 +1060,24 @@ def cli():
             r = client.note(body, handle=args.handle)
         elif args.command == "walk":
             r = client.walk(args.mark_id, handle=args.handle)
+        elif args.command == "leave-mark":
+            body = _load_text_from_arg(args.body) if args.body else None
+            r = client.leave_mark(args.mark_id, body=body, image=args.image,
+                                   handle=args.handle)
+        elif args.command == "stake":
+            r = client.stake(args.mark_id, args.stamps, handle=args.handle)
+        elif args.command == "unstake":
+            r = client.unstake(args.mark_id, args.stamps, handle=args.handle)
+        elif args.command == "give":
+            r = client.give(args.to, args.item, handle=args.handle)
+        elif args.command == "drop":
+            r = client.drop(args.item, handle=args.handle)
+        elif args.command == "enter":
+            r = client.enter(args.mark_id, handle=args.handle)
+        elif args.command == "exit":
+            r = client.exit(handle=args.handle)
+        elif args.command == "withdraw":
+            r = client.withdraw(args.mark_id, handle=args.handle)
         elif args.command == "upload-media":
             with open(args.image_path, "rb") as f:
                 img_bytes = f.read()
