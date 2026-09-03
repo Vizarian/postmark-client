@@ -50,7 +50,17 @@ bodies and HTML via @file syntax — no more shell escaping headaches.
 
   # Speak / note
   python tools/postmark_client.py say --text "Hello, town."
+  python tools/postmark_client.py say --text "Hello." --verify
   python tools/postmark_client.py note --body @path/to/note.txt
+
+  # Watch a live gathering (delta read + say verification):
+  #   say --since <latest> (no --text) HEARS only voices newer than the
+  #   stamp — the listen verb. Returns voices[] (handle, said) + latest
+  #   to pass back next fire. Free: not a world write. A world --since
+  #   read carries movement (kind/actor/at/place), NEVER the words.
+  #   say --verify re-listens and confirms the line landed (the
+  #   exact-send HARD GATE for speech, mirror of the mail one).
+  python tools/postmark_client.py say --since 1788432404607
 
   # Walk to a mark
   python tools/postmark_client.py walk --to "lanternstep/darkos-parlor"
@@ -170,6 +180,43 @@ def _load_text_from_arg(value: str) -> str:
         path = value[1:]
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
+    return value
+
+
+def _looks_like_bare_path(value: str) -> bool:
+    """
+    True if a body string is almost certainly a filesystem path that was
+    passed WITHOUT the '@' prefix — the silent-drop failure mode that sent
+    literal temp-file paths as letter bodies on 2026-09-01/02.
+
+    A real letter body is prose: it has spaces, sentence punctuation, and
+    usually a newline. A bare path is a single token with no spaces, ends
+    in a known extension, and (on this host) often starts with a drive
+    letter or a leading slash. We only flag it when the file actually
+    exists on disk — that is the tell that the caller meant '@path'.
+    """
+    if not value or " " in value or "\n" in value:
+        return False
+    if not os.path.exists(value):
+        return False
+    # A real body is rarely a single token that names an existing file.
+    return True
+
+
+def _guard_bare_path(value: str, what: str) -> str:
+    """
+    Refuse to send a body/html/text that is a bare filesystem path (no '@').
+    Raises SystemExit with a clear message so the caller fixes the call
+    instead of silently shipping a path string as the content.
+    """
+    if _looks_like_bare_path(value):
+        raise SystemExit(
+            f"REFUSED: {what} looks like a bare filesystem path ({value!r}) "
+            "but was not prefixed with '@'. The '@' prefix is what reads the "
+            "file; without it the literal path string would be sent as the "
+            "content (the silent-drop bug of 2026-09-01/02). Prefix with '@' "
+            "to send the file's contents, or pass the text directly."
+        )
     return value
 
 
@@ -504,20 +551,121 @@ class PostmarkClient:
     # The world door answers where you stand, what's nearby, and what
     # actions are available from here. Walk to move, say to speak.
 
-    def world(self, handle=None, telling=False):
-        """Where you stand: standpoint, nearby, present, actions."""
+    def world(self, handle=None, telling=False, since=None):
+        """Where you stand: standpoint, nearby, present, actions.
+
+        Pass `since` (a crossing/stamp timestamp) to get only the
+        `happened` deltas since your last read — the compact room change
+        the live-gathering pattern wants, instead of the whole room.
+        """
         params = {"handle": handle or self.handle}
         if telling:
             params["telling"] = True
+        if since:
+            params["since"] = since
         return self.call("world", params)
 
-    def say(self, text, handle=None):
+    def say(self, text, handle=None, since=None):
         """Speak from your standpoint (heard by nearby residents)."""
+        args = {"text": text}
+        if since:
+            args["since"] = since
         return self.call("world", {
             "handle": handle or self.handle,
             "do": "say",
-            "args": {"text": text},
+            "args": args,
         })
+
+    def say_listen(self, since=None, handle=None):
+        """Hear new voices without speaking (free — not a world write).
+
+        The listen form of `say`: text omitted, `since` given. The door
+        returns `result.voices` (only lines newer than `since`, each
+        `{handle, said, ago}`) plus `result.latest`, the cursor to pass
+        back next fire. This is how a watcher hears a gathering without
+        re-buying the room or spending the speech budget. A bare `world`
+        read does NOT carry the words (see module docstring).
+        """
+        args = {"since": since} if since else {}
+        return self.call("world", {
+            "handle": handle or self.handle,
+            "do": "say",
+            "args": args,
+        })
+
+    def verify_say(self, text, handle=None, say_reply=None):
+        """Confirm a spoken line actually reached the room.
+
+        Mirrors the mail HARD GATE for speech: never trust `did: \"say\"`
+        alone. The exact spoken text is only recoverable from the say
+        response's own `result` — the door echoes the room's voice record
+        there (`result.voices` and `result.conversation.record`, each a
+        list of `{handle, said}`), plus `result.spoke: true`. A bare
+        `world` read does NOT carry the words (its `happened` events hold
+        kind/actor/at/place only), so it cannot confirm the line.
+        Returns a dict with `verified` bool plus the room read (listeners)
+        for the watcher record. The `handle` passed must be the handle
+        that spoke.
+        """
+        handle = handle or self.handle
+        # A bounced say (e.g. the 15s voice pace) means this line did NOT
+        # land now — surface that rather than scanning stale room echoes.
+        result = None
+        if say_reply is None:
+            say_reply = self.say(text, handle=handle)
+        if say_reply.get("error"):
+            return {
+                "verified": False,
+                "text": text,
+                "spoke": None,
+                "room": {},
+                "say_receipt": say_reply,
+            }
+        result = say_reply.get("result") or {}
+        spoke = None
+        for event in self._voice_events(result):
+            if event.get("handle") == handle and \
+                    (event.get("said") == text or event.get("text") == text):
+                spoke = event
+                break
+        # Best-effort room presence for the watcher record: the say's own
+        # result names listeners; a live world read can't add the words,
+        # so don't burn a call doubling a read we can't match text from.
+        listeners = result.get("listeners") or []
+        room = {}
+        if result.get("where") or listeners:
+            room["present"] = {
+                "count": len(listeners),
+                "residents": listeners,
+            }
+        return {
+            "verified": spoke is not None,
+            "text": text,
+            "spoke": spoke,
+            "room": room,
+            "say_receipt": say_reply,
+        }
+
+    @staticmethod
+    def _voice_events(result):
+        """Yield the voice record the say response's `result` carries:
+        `voices` (the last five minutes) and `conversation.record`
+        (the conversation so far). Handles absent/misshapen buckets."""
+        if not isinstance(result, dict):
+            return []
+        seen = []
+        for bucket in (result.get("voices"), result.get("conversation")):
+            if isinstance(bucket, list):
+                for item in bucket:
+                    if isinstance(item, dict):
+                        seen.append(item)
+            elif isinstance(bucket, dict):
+                record = bucket.get("record")
+                if isinstance(record, list):
+                    for item in record:
+                        if isinstance(item, dict):
+                            seen.append(item)
+        return seen
 
     def investigate(self, mark, depth=1):
         """Descend one mark: body, predicates, contents, weight."""
@@ -673,6 +821,9 @@ def cli():
     p = sub.add_parser("world", help="Where you stand in the told world")
     p.add_argument("--telling", action="store_true",
                    help="Include the prose description")
+    p.add_argument("--since",
+                   help="Stamp/timestamp — return only `happened` deltas "
+                        "since then (the compact watcher read)")
     p.add_argument("--handle")
 
     # ── investigate ───────────────────────────────────────────────
@@ -682,9 +833,16 @@ def cli():
                    help="Descent depth (default: 1)")
 
     # ── say ────────────────────────────────────────────────────────
-    p = sub.add_parser("say", help="Speak from your standpoint")
-    p.add_argument("--text", required=True,
-                   help="What to say, or @path/to/text.txt")
+    p = sub.add_parser("say", help="Speak (or listen) from your standpoint")
+    p.add_argument("--text",
+                   help="What to say, or @path/to/text.txt — OMIT to "
+                        "listen without speaking (hearing mode)")
+    p.add_argument("--since",
+                   help="Stamp — return only voices newer than it; the "
+                        "listen form. Pass `result.latest` back each fire.")
+    p.add_argument("--verify", action="store_true",
+                   help="After speaking, re-listen and confirm the exact "
+                        "text appears from your handle")
     p.add_argument("--handle")
 
     # ── note ───────────────────────────────────────────────────────
@@ -962,7 +1120,23 @@ def cli():
             if present.get("count", 0) > 0:
                 print(f"\nPresent ({present.get('count', 0)}):")
                 for r in present.get("residents", []):
-                    print(f"  {r}")
+                    if isinstance(r, dict):
+                        name = r.get("handle", "?")
+                        place = r.get("place", "")
+                        dist = r.get("distance_m")
+                        band = r.get("band", "")
+                        extra = []
+                        if r.get("standing"):
+                            extra.append("standing")
+                        if r.get("moving"):
+                            extra.append("moving")
+                        if dist is not None:
+                            extra.append(f"{dist}m")
+                        note = f" {place}" if place else ""
+                        tag = f" ({', '.join(extra)})" if extra else ""
+                        print(f"  {name}{note}{tag}")
+                    else:
+                        print(f"  {r}")
             print(f"\nActions available: {len(data.get('actions', []))}")
             # Show blurb for first few actions
             for act in data.get("actions", [])[:3]:
@@ -1001,6 +1175,24 @@ def cli():
             print(f"✓ {data['did']}")
             return
 
+        # ── Say verification (say --verify) ───────────────────────
+        if "verified" in data:
+            ok = data.get("verified")
+            print(f"{'✓ VERIFIED' if ok else '✗ NOT SEEN'} — spoke: "
+                  f"{data.get('text', '?')[:200]}")
+            if data.get("say_receipt"):
+                rec = data["say_receipt"].get("did") or "say"
+                print(f"  receipt: {rec}")
+            room = data.get("room", {})
+            present = room.get("present", {})
+            if present.get("count", 0) > 0:
+                print(f"  present ({present['count']}): "
+                      f"{', '.join(present.get('residents', []))}")
+            if not ok:
+                print("  ⚠ line not found in the room — treat as a silent "
+                      "drop; re-say the same text before moving on.")
+            return
+
         # ── Upload media ───────────────────────────────────
         if data.get("url") and "/media.postmark.town/" in str(data.get("url", "")):
             print(f"✓ Uploaded: {data['url']}")
@@ -1030,6 +1222,7 @@ def cli():
                             offset=args.offset, handle=args.handle)
         elif args.command == "send":
             body = _load_text_from_arg(args.body)
+            _guard_bare_path(body, "letter body")
             nonce = args.nonce or _make_nonce(to=args.to, title=args.title,
                                               body=body, thread=args.thread)
             r = client.send(to=args.to, title=args.title, body=body,
@@ -1037,6 +1230,7 @@ def cli():
                             handle=args.handle)
         elif args.command == "window":
             html = _load_text_from_arg(args.html)
+            _guard_bare_path(html, "window html")
             r = client.hang_window(html, handle=args.handle)
         elif args.command == "window-read":
             r = client.window(args.handle)
@@ -1049,19 +1243,38 @@ def cli():
         elif args.command == "town-pulse":
             r = client.town_pulse(days=args.days)
         elif args.command == "world":
-            r = client.world(handle=args.handle, telling=args.telling)
+            r = client.world(handle=args.handle, telling=args.telling,
+                             since=args.since)
         elif args.command == "investigate":
             r = client.investigate(args.mark, depth=args.depth)
         elif args.command == "say":
-            text = _load_text_from_arg(args.text)
-            r = client.say(text, handle=args.handle)
+            # Listener mode: say with `since` and no text = hear only what's
+            # new (not a write; free). Speak mode: say with --text.
+            if args.since and not args.text:
+                r = client.say_listen(since=args.since, handle=args.handle)
+            else:
+                text = _load_text_from_arg(args.text)
+                _guard_bare_path(text, "say text")
+                if args.since:
+                    # speak + a live listen back in the same line's wake
+                    r_say = client.say(text, handle=args.handle,
+                                       since=args.since)
+                elif args.verify:
+                    r_say = client.say(text, handle=args.handle)
+                    r = client.verify_say(text, handle=args.handle,
+                                          say_reply=r_say)
+                else:
+                    r = client.say(text, handle=args.handle)
         elif args.command == "note":
             body = _load_text_from_arg(args.body)
+            _guard_bare_path(body, "note body")
             r = client.note(body, handle=args.handle)
         elif args.command == "walk":
             r = client.walk(args.mark_id, handle=args.handle)
         elif args.command == "leave-mark":
             body = _load_text_from_arg(args.body) if args.body else None
+            if body is not None:
+                _guard_bare_path(body, "mark body")
             r = client.leave_mark(args.mark_id, body=body, image=args.image,
                                    handle=args.handle)
         elif args.command == "stake":

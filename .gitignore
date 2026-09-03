@@ -1,0 +1,6 @@
+# Python build/runtime scratch
+__pycache__/
+*.log
+
+# Diagnostic world-API dumps (regenerable instantly; keep the status clean)
+world_*.json
