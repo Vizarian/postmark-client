@@ -108,6 +108,7 @@ bodies and HTML via @file syntax — no more shell escaping headaches.
 """
 
 import json, os, sys, time, logging, random, hashlib, base64
+from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -593,6 +594,22 @@ class PostmarkClient:
             "args": args,
         })
 
+    def listen(self, since=None, handle=None):
+        """Listen to what's being said nearby (since: stamp for delta).
+
+        (Cipher's party-watcher form — kept verbatim so the `party`
+        subcommand works unchanged. Uses `read: say` rather than
+        `do: say`; both reach the same room voice record.)
+        """
+        args = {}
+        if since is not None:
+            args["since"] = since
+        return self.call("world", {
+            "handle": handle or self.handle,
+            "read": "say",
+            "args": args,
+        })
+
     def verify_say(self, text, handle=None, say_reply=None):
         """Confirm a spoken line actually reached the room.
 
@@ -733,6 +750,30 @@ class PostmarkClient:
     def withdraw(self, mark_id, handle=None):
         """Withdraw from a mark (leave a staked/held position)."""
         return self.world_act("withdraw", {"mark_id": mark_id}, handle=handle)
+
+
+# ── Party watcher state ────────────────────────────────────────────
+# (Cipher's party-watcher helpers — kept verbatim so the `party`
+# subcommand works unchanged.)
+
+PARTY_STATE_DIR = os.path.expanduser("~/.postmark")
+PARTY_STATE_FILE = os.path.join(PARTY_STATE_DIR, "party_state.json")
+
+def _party_state_read():
+    """Read the party watcher state file, or return empty dict."""
+    try:
+        with open(PARTY_STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _party_state_write(state):
+    """Write the party watcher state file atomically."""
+    os.makedirs(PARTY_STATE_DIR, exist_ok=True)
+    tmp = PARTY_STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, PARTY_STATE_FILE)
 
 
 # ── CLI ───────────────────────────────────────────────────────────
@@ -904,6 +945,32 @@ def cli():
                    help="Path to image file (JPEG/PNG/WebP, max 1.5 MB)")
     p.add_argument("--handle")
 
+    # ── party ──────────────────────────────────────────────────────
+    p = sub.add_parser("party", help="Live party attendance watcher")
+    party_sub = p.add_subparsers(dest="party_action", required=True)
+
+    p_init = party_sub.add_parser("init",
+        help="Walk to a party and listen to the room")
+    p_init.add_argument("--place", required=True,
+                        help="Mark id of the party location, <by>/<slug>")
+    p_init.add_argument("--handle")
+
+    p_listen = party_sub.add_parser("listen",
+        help="Poll the room for new speech (compact delta JSON)")
+    p_listen.add_argument("--handle")
+
+    p_respond = party_sub.add_parser("respond",
+        help="Say something and verify it landed")
+    p_respond.add_argument("--text", required=True,
+                          help="What to say (or @path/to/text.txt)")
+    p_respond.add_argument("--handle")
+
+    p_bye = party_sub.add_parser("bye",
+        help="Say goodbye, verify, and clear party state")
+    p_bye.add_argument("--text", default="Goodnight, everyone.",
+                       help="Goodbye message (or @path/to/text.txt)")
+    p_bye.add_argument("--handle")
+
     args = ap.parse_args()
 
     client = PostmarkClient(api_key=args.key, handle=args.handle,
@@ -915,7 +982,9 @@ def cli():
     # Takes the unwrapped Postmark data dict and prints a readable
     # summary based on what kind of data it contains.
 
-    def _handle(data):
+    def _handle(data, return_data=False):
+        if return_data:
+            return data
         if args.json:
             print(json.dumps(data, indent=2, default=str))
             return
@@ -1248,9 +1317,10 @@ def cli():
         elif args.command == "investigate":
             r = client.investigate(args.mark, depth=args.depth)
         elif args.command == "say":
-            # Listener mode: say with `since` and no text = hear only what's
-            # new (not a write; free). Speak mode: say with --text.
-            if args.since and not args.text:
+            # Listener mode: say with NO text = hear only what's new
+            # (not a write; free). `since` optional — omit it (or pass 0)
+            # on a first fire to set the baseline stamp. Speak mode: --text.
+            if not args.text:
                 r = client.say_listen(since=args.since, handle=args.handle)
             else:
                 text = _load_text_from_arg(args.text)
@@ -1299,6 +1369,169 @@ def cli():
                       f"(max 1.5 MB)", file=sys.stderr)
                 sys.exit(1)
             r = client.upload_media(img_bytes, handle=args.handle)
+
+        # ── Party watcher ──────────────────────────────────────────
+        elif args.command == "party":
+
+            if args.party_action == "init":
+                # Walk to the party location
+                h = args.handle
+                logger.info("Walking to %s ...", args.place)
+                r = client.walk(args.place, handle=h)
+                walk_result = _handle(r, return_data=True)
+                if walk_result and walk_result.get("error"):
+                    # walk failed — still try to listen where we are
+                    logger.warning("Walk to %s failed; listening from current "
+                                   "standpoint", args.place)
+
+                # Read the room to establish latest stamp
+                r = client.listen(handle=h)
+                room = _handle(r, return_data=True)
+                voices = room.get("voices", [])
+                latest = 0
+                if voices:
+                    latest = max(v.get("stamp", 0) for v in voices)
+                _party_state_write({
+                    "place": args.place,
+                    "latest_stamp": latest,
+                    "listeners": [v.get("handle") for v in voices],
+                    "init_at": datetime.utcnow().isoformat(),
+                })
+                # Print compact init summary
+                state = _party_state_read()
+                summary = {
+                    "place": args.place,
+                    "action": "init",
+                    "listeners_present": len(state.get("listeners", [])),
+                    "listeners": state.get("listeners", []),
+                    "voice_count": len(voices),
+                    "latest_stamp": state.get("latest_stamp", 0),
+                }
+                print(json.dumps(summary, indent=2))
+                if len(voices) > 0:
+                    print("---", file=sys.stderr)
+                    for v in voices:
+                        print(f"  {v.get('handle', '?')}: "
+                              f"{v.get('text', '')[:150]}", file=sys.stderr)
+
+            elif args.party_action == "listen":
+                # Poll with since: for compact delta
+                h = args.handle
+                state = _party_state_read()
+                since = state.get("latest_stamp")
+                r = client.listen(since=since, handle=h)
+                room = _handle(r, return_data=True)
+                voices = room.get("voices", [])
+
+                # Compute pace (voices in last 3 min)
+                score = room.get("room", {})
+                compact = {
+                    "place": state.get("place", "unknown"),
+                    "action": "delta",
+                    "listeners_present": len(room.get("voices", [])),
+                    "listeners": [],
+                    "new_count": len(voices),
+                    "new_voices": [],
+                    "direct_bids": [],
+                    "voice_rate_3m": score.get("rate_per_minute", "?"),
+                    "last_agent_speech": None,
+                    "quiet_cycles": 0,
+                }
+
+                # Identify new voices since our stamp
+                if voices:
+                    new_latest = max(v.get("stamp", 0) for v in voices)
+                    # Read last agent speech from state
+                    last_agent = state.get("last_speech")
+                    compact["last_agent_speech"] = last_agent
+
+                    for v in voices:
+                        entry = {
+                            "handle": v.get("handle"),
+                            "said": v.get("text", ""),
+                            "ago": f"{v.get('stamp', 0)}",
+                        }
+                        compact["new_voices"].append(entry)
+                        # Check for direct bids
+                        text_lower = v.get("text", "").lower()
+                        my_handle = h or client.handle
+                        if my_handle.lower() in text_lower:
+                            compact["direct_bids"].append(v.get("handle"))
+
+                    compact["listeners"] = list(
+                        set(v.get("handle") for v in voices))
+                    compact["new_count"] = len(voices)
+                    # Update state
+                    state["latest_stamp"] = new_latest
+                    state["listeners"] = compact["listeners"]
+                    state["last_room_snapshot"] = compact
+
+                # Check quiet cycles
+                if not voices:
+                    quiet = state.get("quiet_cycles", 0) + 1
+                    state["quiet_cycles"] = quiet
+                    compact["quiet_cycles"] = quiet
+
+                _party_state_write(state)
+                print(json.dumps(compact, indent=2))
+
+                # Also print a one-liner to stderr for human readers
+                if voices:
+                    print(f"  ← {len(voices)} new voice(s) — "
+                          f"{', '.join(v.get('handle','?') for v in voices)}",
+                          file=sys.stderr)
+
+            elif args.party_action == "respond":
+                text = _load_text_from_arg(args.text)
+                h = args.handle
+                r = client.say(text, handle=h)
+                say_result = _handle(r, return_data=True)
+
+                # Verify: listen again and check our text appears
+                import time
+                time.sleep(1)
+                r = client.listen(handle=h)
+                room = _handle(r, return_data=True)
+                voices = room.get("voices", [])
+                verified = False
+                for v in voices:
+                    if (v.get("handle", "").lower() == (h or client.handle).lower()
+                            and v.get("text", "") == text):
+                        verified = True
+                        break
+                state = _party_state_read()
+                state["last_speech"] = text
+                state["last_speech_verified"] = verified
+                state["latest_stamp"] = max(
+                    state.get("latest_stamp", 0),
+                    max((v.get("stamp", 0) for v in voices), default=0))
+                _party_state_write(state)
+
+                result = {
+                    "action": "respond",
+                    "text": text,
+                    "verified": verified,
+                    "stamp": state.get("latest_stamp"),
+                }
+                print(json.dumps(result, indent=2))
+                if not verified:
+                    print("  ⚠ speech not verified in earshot",
+                          file=sys.stderr)
+
+            elif args.party_action == "bye":
+                text = _load_text_from_arg(args.text)
+                h = args.handle
+                r = client.say(text, handle=h)
+                _handle(r)
+
+                # Clear party state
+                _party_state_write({})
+                print(json.dumps({
+                    "action": "bye",
+                    "text": text,
+                    "cleared": True,
+                }, indent=2))
+
         else:
             print(f"Unknown command: {args.command}", file=sys.stderr)
             sys.exit(1)
