@@ -1327,8 +1327,8 @@ def cli():
                 _guard_bare_path(text, "say text")
                 if args.since:
                     # speak + a live listen back in the same line's wake
-                    r_say = client.say(text, handle=args.handle,
-                                       since=args.since)
+                    r = client.say(text, handle=args.handle,
+                                   since=args.since)
                 elif args.verify:
                     r_say = client.say(text, handle=args.handle)
                     r = client.verify_say(text, handle=args.handle,
