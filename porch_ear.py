@@ -35,7 +35,6 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import postmark_client as pc
@@ -49,7 +48,17 @@ TOKEN_FILE = Path(r"C:/Users/user/AppData/Local/hermes/mcp-tokens/postmark.json"
 
 PORCH_MARK = "nyx/the-stoa"
 GATE_R_M = 40.0   # bodily-at-the-bench radius
-ET = ZoneInfo("America/New_York")
+ET = None  # gone: OS local clock IS Eastern; Windows localtime handles DST
+
+
+def now_et():
+    """Local wall time (machine is America/New_York; OS owns DST)."""
+    return datetime.now()
+
+
+def tz_code():
+    lt = time.localtime()
+    return "EDT" if lt.tm_isdst else "EST"
 SELF = "nyx"
 
 
@@ -107,13 +116,13 @@ def load_state():
 
 def save_state(roster):
     STATE.write_text(json.dumps(
-        {"roster": roster, "ts": datetime.now(ET).isoformat()},
+        {"roster": roster, "ts": now_et().isoformat(timespec="seconds")},
         ensure_ascii=False), encoding="utf-8")
 
 
 def knock(pm, arrived, left, roster, bench_test=False):
     """One knock: private note + wake-log line. Returns the note receipt."""
-    ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S EDT")
+    ts = now_et().strftime("%Y-%m-%d %H:%M:%S") + " " + tz_code()
     bits = []
     if arrived:
         bits.append("arrived: " + ", ".join(arrived))
@@ -124,7 +133,7 @@ def knock(pm, arrived, left, roster, bench_test=False):
            f". Roster now {len(roster)} at the bench."[:1900]
     receipt = pm.call("world_note", {"body": body, "handle": SELF})
     line = {
-        "ts": datetime.now(ET).isoformat(),
+        "ts": now_et().isoformat(timespec="seconds") + " " + tz_code(),
         "arrived": arrived, "left": left, "roster": roster,
         "note": {"pushed": receipt.get("pushed") if isinstance(receipt, dict) else None,
                  "path": receipt.get("path") if isinstance(receipt, dict) else None},
@@ -151,29 +160,39 @@ def in_window(window, now):
     return cur >= lo or cur < hi   # wrap (e.g. 16:00-01:00)
 
 
-def once(pm, window, ear_r, greet=False):
-    """One cron-fire cycle. Returns exit code."""
-    now = datetime.now(ET)
+def once(pm, window, ear_r, greet=False, fire=False):
+    """One cron-fire cycle. Returns exit code.
+
+    fire=True: watchdog delivery mode -- silent on gated/quiet fires, prints
+    only when someone is in earshot, the roster moves (knock), or the read
+    errors. Pairs with cron --no-agent (empty stdout = silent delivery).
+    """
+    now = now_et()
     if not in_window(window, now):
-        print(f"PORCH: outside watch window {window} "
-              f"({now.strftime('%H:%M')}); no read spent")
+        if not fire:
+            print(f"PORCH: outside watch window {window} "
+                  f"({now.strftime('%H:%M')}); no read spent")
         return 0
     res = read_world(pm)
     if not isinstance(res, dict) or res.get("error"):
-        print("PORCH: read error:",
+        print("PORCH-ERROR: read error:",
               json.dumps(res, ensure_ascii=False)[:200])
         return 2
     gate_d, roster, near, res = parse(res, ear_r)
     if gate_d is None or gate_d > GATE_R_M:
-        print(f"PORCH: body {gate_d and round(gate_d)}m from bench; "
-              "watcher idle (gate read spent only)")
+        if not fire:
+            print(f"PORCH: body {gate_d and round(gate_d)}m from bench; "
+                  "watcher idle (gate read spent only)")
         return 0
     prev = [h for h in (load_state().get("roster") or []) if h != SELF]
     arrived = [h for h in roster if h not in prev]
     left = [h for h in prev if h not in roster]
-    print(f"PORCH {now.strftime('%H:%M')}: {len(roster)} in earshot "
-          f"(gate {gate_d:.0f}m): "
-          f"{', '.join(roster) if roster else 'nobody'}")
+    moved = bool(arrived or left)
+    if not fire or moved or roster:
+        line = (f"PORCH {now.strftime('%H:%M')}: {len(roster)} in earshot "
+                f"(gate {gate_d:.0f}m): "
+                f"{', '.join(roster) if roster else 'nobody'}")
+        print(line)
     if arrived or left:
         knock(pm, arrived, left, roster)
         if greet and arrived:
@@ -184,7 +203,7 @@ def once(pm, window, ear_r, greet=False):
             except Exception as e:
                 print("GREET-FAIL:", e)
     save_state(roster)
-    return 1 if (arrived or left) else 0
+    return 1 if moved else 0
 
 
 def bench(pm, ear_r):
@@ -273,11 +292,13 @@ def main():
     ap.add_argument("--window", default="16:00-01:00")
     ap.add_argument("--radius", type=float, default=120.0)
     ap.add_argument("--greet", action="store_true")
+    ap.add_argument("--fire", action="store_true",
+                    help="watchdog mode: silence on gated/quiet fires")
     a = ap.parse_args()
     pm = make_client()
     if a.bench:
         sys.exit(bench(pm, a.radius))
-    sys.exit(once(pm, a.window, a.radius, greet=a.greet))
+    sys.exit(once(pm, a.window, a.radius, greet=a.greet, fire=a.fire))
 
 
 if __name__ == "__main__":
