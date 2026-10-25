@@ -18,13 +18,24 @@ Modes:
     --once                  one gate+earshot cycle (cron fire mode)
     --bench                 two cycles 130 s apart, then a seeded-arrival
                             knock self-test against the live door
-    --window 16:00-01:00    EDT watch window (wrap-around allowed);
-                            outside it: exit with NO read spent at all
+    --arm                   sit down at the portico: one read verifies the
+                            body is on the porch, then arms the ear
+                            (refuses if the body is off-portico)
+    --stand-down            leave the bench: disarm, zero reads after
+    --window 09:00-01:00    EDT watch window (wrap-around allowed). The
+                            complement, 01:00-09:00, is the SLEEP span
+                            (8 h, less-than-vigilant): fires exit with
+                            zero reads. Watch resumes 09:00.
     --radius N              earshot radius for the diff roster (default 120)
     --greet                 speak one <=500-char greeting on arrivals
 
-State:  porch-ear-state.json  (last roster)
-Wakes:  porch-ear-wake.jsonl  (every knock, append-only)
+Spending rule: armed only. Arming costs one read; armed fires spend one
+read each (the gate IS the read); anything else spends nothing. Armed
+state auto-clears on: body leaving the portico, armed-TTL (4 h, re-arm
+to continue), 3 consecutive read errors, or the window closing.
+
+State:  porch-ear-state.json  (roster, armed, armed_ts, err_count)
+Wakes:  porch-ear-wake.jsonl  (every knock and stand-down, append-only)
 Exit:   0 = quiet/gated, 1 = knocked, 2 = error
 """
 import argparse
@@ -115,9 +126,60 @@ def load_state():
 
 
 def save_state(roster):
-    STATE.write_text(json.dumps(
-        {"roster": roster, "ts": now_et().isoformat(timespec="seconds")},
-        ensure_ascii=False), encoding="utf-8")
+    st = load_state()
+    st["roster"] = sorted(set(list(roster)) - {SELF})
+    st["ts"] = now_et().isoformat(timespec="seconds")
+    STATE.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+
+
+ARMED_TTL_H = 4.0      # a sit longer than this wants a re-arm
+MAX_READ_ERRORS = 3    # consecutive errors while armed -> stand down
+
+
+def wake_log(entry):
+    with WAKE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def arm(pm):
+    """Sit down on the portico. One read to verify the body, then arm.
+    Refuses if the body is not actually at the bench."""
+    res = read_world(pm)
+    gate_d, roster, near, _ = parse(res, 120.0) if isinstance(res, dict) else (None, [], [], res)
+    where = "unknown (door shape read)" if gate_d is None else f"{round(gate_d)} m from the bench"
+    if gate_d is None or gate_d > GATE_R_M:
+        print(f"ARM-REFUSED: body {where}; "
+              "the ear only watches from the portico")
+        return 2
+    st = load_state()
+    st["armed"] = True
+    st["armed_ts"] = now_et().isoformat(timespec="seconds")
+    st["err_count"] = 0
+    st["roster"] = sorted(set(roster) - {SELF})
+    st["ts"] = now_et().isoformat(timespec="seconds")
+    STATE.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    print(f"ARMED: ear on at the Stoa (gate {gate_d:.0f} m; "
+          f"{len(st['roster'])} present on arrival: "
+          f"{', '.join(st['roster']) if st['roster'] else 'nobody'}). "
+          "Baseline set; only arrivals/departures knock. TTL 4 h.")
+    return 0
+
+
+def stand_down():
+    st = load_state()
+    if not st.get("armed"):
+        print("STAND-DOWN: the ear was not armed")
+        return 0
+    st["armed"] = False
+    st["armed_ts"] = None
+    st["roster"] = []
+    st["ts"] = now_et().isoformat(timespec="seconds")
+    STATE.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    wake_log({"ts": now_et().isoformat(timespec="seconds") + " " + tz_code(),
+              "arrived": [], "left": [], "roster": [],
+              "note": {"event": "manual stand-down"}, "pushed": None, "path": None})
+    print("STAND-DOWN: ear off, zero reads until re-armed")
+    return 0
 
 
 def knock(pm, arrived, left, roster, bench_test=False):
@@ -163,46 +225,87 @@ def in_window(window, now):
 def once(pm, window, ear_r, greet=False, fire=False):
     """One cron-fire cycle. Returns exit code.
 
-    fire=True: watchdog delivery mode -- silent on gated/quiet fires, prints
-    only when someone is in earshot, the roster moves (knock), or the read
-    errors. Pairs with cron --no-agent (empty stdout = silent delivery).
+    Spending rule: the window is the day's boundary (its complement is the
+    sleep span, zero reads), arming is the switch (zero reads while
+    disarmed), and the gate read IS the spend while armed.
+    fire=True: watchdog delivery mode -- silent on gated/quiet fires.
     """
     now = now_et()
     if not in_window(window, now):
-        if not fire:
-            print(f"PORCH: outside watch window {window} "
-                  f"({now.strftime('%H:%M')}); no read spent")
-        return 0
+        return 0                      # sleep side of the day: zero reads
+    st = load_state()
+    if not st.get("armed"):
+        return 0                      # disarmed: zero reads
+    # armed-TTL: a sit longer than ARMED_TTL_H wants a re-arm
+    if st.get("armed_ts"):
+        try:
+            t0 = datetime.fromisoformat(st["armed_ts"])
+        except Exception:
+            t0 = None
+        if t0 and (now - t0).total_seconds() > ARMED_TTL_H * 3600:
+            st["armed"] = False
+            st["armed_ts"] = None
+            st["ts"] = now_et().isoformat(timespec="seconds")
+            STATE.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+            wake_log({"ts": now_et().isoformat(timespec="seconds") + " " + tz_code(),
+                      "arrived": [], "left": [], "roster": [],
+                      "note": {"event": "armed-TTL expiry; stood down (re-arm to continue)"},
+                      "pushed": None, "path": None})
+            if not fire:
+                print("PORCH: armed TTL expired; stood down (re-arm to continue)")
+            return 0
     res = read_world(pm)
     if not isinstance(res, dict) or res.get("error"):
+        st["err_count"] = int(st.get("err_count") or 0) + 1
+        st["ts"] = now_et().isoformat(timespec="seconds")
+        STATE.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
         print("PORCH-ERROR: read error:",
               json.dumps(res, ensure_ascii=False)[:200])
+        if int(st["err_count"]) >= MAX_READ_ERRORS:
+            st["armed"] = False
+            st["ts"] = now_et().isoformat(timespec="seconds")
+            STATE.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+            wake_log({"ts": now_et().isoformat(timespec="seconds") + " " + tz_code(),
+                      "arrived": [], "left": [], "roster": [],
+                      "note": {"event": f"stood down after {st['err_count']} consecutive read errors"},
+                      "pushed": None, "path": None})
+            print("PORCH: stood down after repeated read errors; re-arm when the door recovers")
         return 2
+    st["err_count"] = 0
     gate_d, roster, near, res = parse(res, ear_r)
     if gate_d is None or gate_d > GATE_R_M:
+        st["armed"] = False           # the body walked off: one detection read
+        st["roster"] = []
+        st["ts"] = now_et().isoformat(timespec="seconds")
+        STATE.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        wake_log({"ts": now_et().isoformat(timespec="seconds") + " " + tz_code(),
+                  "arrived": [], "left": [], "roster": [],
+                  "note": {"event": f"body left the portico ({gate_d and round(gate_d)} m); stood down"},
+                  "pushed": None, "path": None})
         if not fire:
             print(f"PORCH: body {gate_d and round(gate_d)}m from bench; "
-                  "watcher idle (gate read spent only)")
+                  "stood down (re-arm at the bench)")
         return 0
-    prev = [h for h in (load_state().get("roster") or []) if h != SELF]
+    prev = [h for h in (st.get("roster") or []) if h != SELF]
     arrived = [h for h in roster if h not in prev]
     left = [h for h in prev if h not in roster]
     moved = bool(arrived or left)
     if not fire or moved or roster:
-        line = (f"PORCH {now.strftime('%H:%M')}: {len(roster)} in earshot "
-                f"(gate {gate_d:.0f}m): "
-                f"{', '.join(roster) if roster else 'nobody'}")
-        print(line)
-    if arrived or left:
+        print(f"PORCH {now.strftime('%H:%M')}: {len(roster)} in earshot "
+              f"(gate {gate_d:.0f}m): "
+              f"{', '.join(roster) if roster else 'nobody'}")
+    if moved:
         knock(pm, arrived, left, roster)
-        if greet and arrived:
-            names = ", ".join(arrived)
-            try:
-                pm.say(f"evening {names} -- the bench is yours; lamp's lit.")
-                print("GREETED:", names)
-            except Exception as e:
-                print("GREET-FAIL:", e)
-    save_state(roster)
+    if greet and arrived:
+        names = ", ".join(arrived)
+        try:
+            pm.say(f"evening {names} -- the bench is yours; lamp's lit.")
+            print("GREETED:", names)
+        except Exception as e:
+            print("GREET-FAIL:", e)
+    st["roster"] = sorted(set(roster) - {SELF})
+    st["ts"] = now_et().isoformat(timespec="seconds")
+    STATE.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
     return 1 if moved else 0
 
 
@@ -289,7 +392,9 @@ def main():
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--once", action="store_true")
     g.add_argument("--bench", action="store_true")
-    ap.add_argument("--window", default="16:00-01:00")
+    g.add_argument("--arm", action="store_true")
+    g.add_argument("--stand-down", action="store_true")
+    ap.add_argument("--window", default="09:00-01:00")
     ap.add_argument("--radius", type=float, default=120.0)
     ap.add_argument("--greet", action="store_true")
     ap.add_argument("--fire", action="store_true",
@@ -298,6 +403,10 @@ def main():
     pm = make_client()
     if a.bench:
         sys.exit(bench(pm, a.radius))
+    if a.arm:
+        sys.exit(arm(pm))
+    if a.stand_down:
+        sys.exit(stand_down())
     sys.exit(once(pm, a.window, a.radius, greet=a.greet, fire=a.fire))
 
 
