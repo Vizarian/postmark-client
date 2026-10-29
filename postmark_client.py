@@ -329,7 +329,7 @@ class PostmarkClient:
 
         for attempt in range(1, retries + 1):
             try:
-                with urlopen(req, timeout=30) as resp:
+                with urlopen(req, timeout=max(30, int(os.environ.get("POSTMARK_TIMEOUT", "30")))) as resp:
                     body = resp.read().decode("utf-8")
                 parsed = _parse_response(body)
 
@@ -378,8 +378,10 @@ class PostmarkClient:
                             self.log.error("postmark error: %s", err_obj)
 
                     self.log.info("%s → %s (id=%d)", tool,
-                                  unwrapped.get("did") or
-                                  unwrapped.get("letter_id", "read ok"),
+                                  (unwrapped.get("did") or
+                                   unwrapped.get("letter_id", "read ok"))
+                                  if isinstance(unwrapped, dict)
+                                  else ("list[%d]" % len(unwrapped)),
                                   self._id)
                     return unwrapped
 
@@ -741,7 +743,7 @@ class PostmarkClient:
 
     def enter(self, mark_id, handle=None):
         """Enter a mark (a room, a building)."""
-        return self.world_act("enter", {"mark_id": mark_id}, handle=handle)
+        return self.world_act("enter", {"mark": mark_id, "accept": True}, handle=handle)
 
     def exit(self, handle=None):
         """Exit the mark you are inside."""
